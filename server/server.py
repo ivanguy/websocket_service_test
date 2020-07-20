@@ -4,97 +4,112 @@ import os
 from uuid import uuid4
 
 import aioredis
+import aiohttp
 from aiohttp import web
-from aioredis_lock import RedisLock, LockTimeoutError
 
 REDIS_PORT = os.environ.get('REDIS_PORT', '')
 RUN_PORT = int(os.environ.get('RUN_PORT', 8000))
+DROP_CLIENT_CHANNEL_NAME = 'drop_client_channel'
 
-SERVER_ID = uuid4()
-clients = dict()
-logging.basicConfig(level=logging.DEBUG)
+if os.environ.get('PYTHONASYNCIODEBUG'):
+    logging.basicConfig(level=logging.DEBUG)
 
-# redis clanup context conn
-# async def redis conn (app)
-# app['redis]' == redis.conn
-# yield
-# app['redis'].close()
-# await app['resid']is_closed()
 
-async def connect(request):
+async def handle_ws_connect(request):
     """Accept HTTP connection with Upgrade to ws
     """
     client_id = request.query.get('client_id')
     assert client_id  # TODO
-    if not clients.get(client_id):
-        async with RedisLock(
-                app['redis'],
-                client_id,
-                timeout=5,
-                wait_timeout=10
-        ) as db_session_lock:
-            # getset
-            # publish disconnect
-            session_str = await app['redis'].get('client_id')
+    session_id = uuid4()
+    if ws := request.app['clients'].get(client_id):
+        await ws.close()
+    else:
+        await request.app['redis_pool'].publish(DROP_CLIENT_CHANNEL_NAME, client_id)
+    await request.app['redis_pool'].set(client_id, session_id)
 
-    # add to clients tasks
     try:
         ws = web.WebSocketResponse()
+        app['clients'][client_id] = ws
         await ws.prepare(request)
-        session_id = uuid4()
-        res = await ws.send_str(str(session_id))
+        await ws.send_str(str(session_id))
         # try:
-        async for msg in ws:
-            print(msg)  # TODO msg.type PING PONG TEXT
-        # except ws CLOSED exc
-    except asyncio.exceptions.CancelledError:
-        ws.close()
-        # drop client
+        ping = False
+        while True:
+            try:
+                msg = await ws.receive(timeout=5)
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    print(msg.data)
+                elif msg.type == aiohttp.WSMsgType.PING:
+                    await ws.pong(msg.data)
+                elif msg.type == aiohttp.WSMsgType.PONG:
+                    ping = False
+                else:
+                    break
+            except asyncio.TimeoutError:
+                if not ping:
+                    ping = True
+                    await ws.ping()
+                else:
+                    break
+    finally:
+        await ws.close()
+        deleted = await app['redis_pool'].eval(
+            "if redis.call('get', KEYS[1])==ARGV[1] do redis.call('del', KEYS[1]) return 1 end return 0",
+            [client_id],
+            [session_id])
+        if not deleted:
+            app.logger.debug("%s session_id changed before closing session %s", client_id, session_id)
+        app['clients'].pop(client_id, None)
     return ws
 
 
-async def redis_connect(app):
+async def redis_connect_ctx_mngr(app):
     """Redis connection pool context manager"""
+    # on_startup
     conn_string = 'redis://localhost'
     conn_string += f":{REDIS_PORT}" if REDIS_PORT else ''
-    app['redis'] = await aioredis.create_redis_pool(conn_string)
+    app['redis_pool'] = await aioredis.create_redis_pool(conn_string)
+    app.logger.debug('Connected to redis at %s', app['redis_pool'].address)
     yield
-    app['redis'].close()
-    await app['redis'].wait_closed()
+    # on_cleanup
+    app['redis_pool'].close()
+    await app['redis_pool'].wait_closed()
+    app.logger.debug('Redis connection closed')
 
 
-async def del_key(client_id):
-    """Del client_id session, passing if client is connecting with another server
+async def del_sessions_from_redis(app):
+    """Remove session keys from redis using lua script (transactional)
     """
-    try:
-        async with RedisLock(app['redis'], client_id, wait_timeout=1):
-            await app['redis'].delete(client_id)
-    except LockTimeoutError:
-        pass
+    deleted = await app['redis_pool'].eval(
+        script="local count=0 "
+               "for i, key in ipairs(KEYS) do"
+               " if redis.call('get', key)==ARGV[i]"
+               " then redis.call('DEL', key) count=count+1 end "
+               "end "
+               "return count",
+        keys=[app['clients'].keys()],
+        args=[app['clients'].values()])  # TODO ws are stored here, we need session_ids
+    app.logger.debug('%s sessions deleted from redis', deleted)
 
 
-async def del_sessions(app):
-    tasks = (asyncio.create_task(del_key(key)) for key in clients.keys())
-    await asyncio.wait(tasks)
-
-
-async def redis_drop_sub(app):
+async def redis_drop_client_listener(app):
     """Listens to drop client commands from MQ"""
-    redis_pool = app['redis']
-    with await app['redis'] as conn:
-        channels = await conn.subscribe(str(SERVER_ID))
+    async with app['redis_pool'] as conn:
+        channels = await conn.subscribe(DROP_CLIENT_CHANNEL_NAME)
         channel = channels[0]
-
         async for client_id in channel.iter():
-            ws = clients.get(client_id)
-            ws.close()
+            ws = app['clients'].get(client_id)
+            if ws:
+                await ws.close()
+                app['clients'].pop(client_id, None)
 
 
 app = web.Application()
-app.add_routes([web.get('/', connect)])
-app.cleanup_ctx.append(redis_connect)
-# app.on_startup.append(redis_drop_sub)
-app.on_shutdown.append(del_sessions)
+app.add_routes([web.get('/', handle_ws_connect)])
+app.cleanup_ctx.append(redis_connect_ctx_mngr)
+app.on_startup.append(redis_drop_client_listener)
+# app.on_shutdown.append(del_sessions_from_redis)
+app['clients'] = dict()
 # disconnect handler
 
 if __name__ == '__main__':
