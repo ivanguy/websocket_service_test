@@ -20,9 +20,10 @@ async def handle_ws_connect(request):
     """
     client_id = request.query.get('client_id')
     assert client_id  # TODO
-    session_id = uuid4()
-    if ws := request.app['clients'].get(client_id):
-        await ws.close()
+    session_id = str(uuid4())
+    old_ws = request.app['clients'].get(client_id, None)
+    if old_ws is not None:
+        await old_ws.close()
     else:
         await request.app['redis_pool'].publish(DROP_CLIENT_CHANNEL_NAME, client_id)
     await request.app['redis_pool'].set(client_id, session_id)
@@ -46,15 +47,11 @@ async def handle_ws_connect(request):
                 else:
                     break
             except asyncio.TimeoutError:
-                if not ping:
-                    ping = True
-                    await ws.ping()
-                else:
-                    break
+                await ws.ping()
     finally:
         await ws.close()
         deleted = await app['redis_pool'].eval(
-            "if redis.call('get', KEYS[1])==ARGV[1] do redis.call('del', KEYS[1]) return 1 end return 0",
+            "if redis.call('get', KEYS[1])==ARGV[1] then redis.call('del', KEYS[1]) return 1 end return 0",
             [client_id],
             [session_id])
         if not deleted:
@@ -92,22 +89,26 @@ async def del_sessions_from_redis(app):
     app.logger.debug('%s sessions deleted from redis', deleted)
 
 
-async def redis_drop_client_listener(app):
+async def create_drop_client_listener(app):
     """Listens to drop client commands from MQ"""
-    async with app['redis_pool'] as conn:
-        channels = await conn.subscribe(DROP_CLIENT_CHANNEL_NAME)
-        channel = channels[0]
-        async for client_id in channel.iter():
-            ws = app['clients'].get(client_id)
-            if ws:
-                await ws.close()
-                app['clients'].pop(client_id, None)
+    async def listen_drop_channel(app):
+        with await app['redis_pool'] as conn:
+            channels = await conn.subscribe(DROP_CLIENT_CHANNEL_NAME)
+            channel = channels[0]
+            async for client_id in channel.iter():
+                client_id = client_id.decode()
+                app.logger.debug("Recieved drop message %s", client_id)
+                ws = app['clients'].get(client_id)
+                if ws is not None:
+                    await ws.close()
+                    app['clients'].pop(client_id, None)
+    asyncio.get_event_loop().create_task(listen_drop_channel(app))
 
 
 app = web.Application()
 app.add_routes([web.get('/', handle_ws_connect)])
 app.cleanup_ctx.append(redis_connect_ctx_mngr)
-app.on_startup.append(redis_drop_client_listener)
+app.on_startup.append(create_drop_client_listener)
 # app.on_shutdown.append(del_sessions_from_redis)
 app['clients'] = dict()
 # disconnect handler
