@@ -25,20 +25,25 @@ async def handle_ws_connect(request):
     client_id = request.query.get('client_id')
     assert client_id  # TODO
     session_id = str(uuid4())
-    old_ws = request.app['sockets'].get(client_id, None)
-    if old_ws is not None:
-        await old_ws.close()
-    else:
-        await request.app['redis_pool'].publish(DROP_CLIENT_CHANNEL_NAME, client_id)
-    await request.app['redis_pool'].set(client_id, session_id)
 
     ws = web.WebSocketResponse()
     try:
-        app['sockets'][client_id] = ws
-        app['sessions'][client_id] = session_id
         await ws.prepare(request)
         await ws.send_str(str(session_id))
+
+        # Close session withsame client id
+        old_ws = request.app['sockets'].get(client_id, None)
+        request.app['sessions'].get(client_id, None)
+        if old_ws is not None:
+            await old_ws.close()
+        else:
+            await request.app['redis_pool'].publish(DROP_CLIENT_CHANNEL_NAME, client_id)
+        await request.app['redis_pool'].set(client_id, session_id)
+
+        app['sockets'][client_id] = ws
+        app['sessions'][client_id] = session_id
         app.logger.info(f"Client {client_id} connected with session {session_id}")
+
         ping = False
         while True:
             try:
@@ -62,8 +67,12 @@ async def handle_ws_connect(request):
             [session_id])
         if not deleted:
             app.logger.debug("%s session_id changed before closing session %s", client_id, session_id)
-        app['sockets'].pop(client_id, None)
-        app['sessions'].pop(client_id, None)
+        ctx_ws = app['sockets'].get(client_id, None)
+        if ctx_ws == ws:
+            app['sockets'].pop(client_id)
+        ctx_session = app['sessions'].get(client_id, None)
+        if ctx_session == session_id:
+            app['sessions'].pop(client_id)
         app.logger.info(f"Client {client_id} {session_id} disconnected")
     return ws
 
