@@ -18,8 +18,10 @@ class Client:
                 while True:
                     try:
                         msg = await web_socket.receive(timeout=5)
+                        print(msg.type)
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             self.session_id = msg.data
+                            print(msg.data)
                         elif msg.type == aiohttp.WSMsgType.PING:
                             await web_socket.pong(msg.data)
                         elif msg.type == aiohttp.WSMsgType.PONG:
